@@ -276,7 +276,7 @@ def main():
     parser.add_argument(
         "--out-csv",
         type=str,
-        default="kernel_pier_project/results/tables/exp1_synthetic_kernel.csv",
+        default="../results/tables/exp1_synthetic_kernel.csv",
     )
     args = parser.parse_args()
 

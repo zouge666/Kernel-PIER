@@ -17,9 +17,6 @@ class KernelDISCOResult:
     residuals_by_lambda: Dict[float, np.ndarray]
     mean_abs_residual_by_lambda: Dict[float, float]
     predictions_by_lambda: Dict[float, np.ndarray]
-    best_lambda: float
-    best_residuals: np.ndarray
-    best_predictions: np.ndarray
 
 
 class KernelDISCOSolver:
@@ -136,18 +133,11 @@ class KernelDISCOSolver:
             predictions_by_lambda[lam_f] = pred_eval
             mean_abs_residual_by_lambda[lam_f] = float(np.mean(np.abs(residual_eval)))
 
-        best_lambda = min(mean_abs_residual_by_lambda, key=mean_abs_residual_by_lambda.get)
-        best_residuals = residuals_by_lambda[best_lambda]
-        best_predictions = predictions_by_lambda[best_lambda]
-
         return KernelDISCOResult(
             lambdas=lambda_list,
             residuals_by_lambda=residuals_by_lambda,
             mean_abs_residual_by_lambda=mean_abs_residual_by_lambda,
             predictions_by_lambda=predictions_by_lambda,
-            best_lambda=float(best_lambda),
-            best_residuals=best_residuals,
-            best_predictions=best_predictions,
         )
 
 

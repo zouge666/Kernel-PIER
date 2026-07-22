@@ -1,24 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import sys
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.kernel_ridge import KernelRidge
-
-try:
-    import torch  # type: ignore
-except Exception:
-    torch = None
-
-try:
-    from datasets import load_dataset  # type: ignore
-except Exception:
-    load_dataset = None
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 KERNEL_PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -27,57 +17,11 @@ if str(ROOT_DIR) not in sys.path:
 if str(KERNEL_PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(KERNEL_PROJECT_DIR))
 
-from isqed.core import Intervention, ModelUnit
-from isqed.ecosystem import Ecosystem
+from isqed.geometry import DISCOSolver
+from isqed.real_world import HuggingFaceWrapper, MaskingIntervention
 
-try:
-    from isqed.real_world import HuggingFaceWrapper
-except Exception:
-    HuggingFaceWrapper = None
-
-from experiments.utils import make_stable_seed
-
-try:
-    from isqed.geometry import DISCOSolver
-except Exception:
-    DISCOSolver = None
-
-
-class DeterministicTextModel(ModelUnit):
-    def __init__(self, name: str, a: float, b: float, c: float):
-        super().__init__(name=name)
-        self.a = float(a)
-        self.b = float(b)
-        self.c = float(c)
-
-    def _forward(self, text_input):
-        text = str(text_input)
-        tokens = text.split()
-        n = max(1, len(tokens))
-        n_mask = sum(1 for t in tokens if t == "[MASK]")
-        mask_ratio = n_mask / float(n)
-        digest = hashlib.md5((self.name + "||" + text).encode("utf-8")).hexdigest()
-        h = (int(digest[:8], 16) % 10000) / 10000.0
-        z = self.a * (1.0 - mask_ratio) + self.b * np.sin(4.0 * h + self.c) + 0.2 * np.tanh(2.0 * h - 1.0)
-        return float(1.0 / (1.0 + np.exp(-z)))
-
-
-class SimpleMaskingIntervention(Intervention):
-    def apply(self, x, theta: float, seed: int | None = None):
-        text = str(x)
-        tokens = text.split()
-        if not tokens:
-            return text
-        frac = min(max(float(theta), 0.0), 1.0)
-        k = int(round(frac * len(tokens)))
-        if k <= 0:
-            return text
-        rng = np.random.RandomState(0 if seed is None else int(seed))
-        idx = np.arange(len(tokens))
-        rng.shuffle(idx)
-        mask_idx = set(idx[:k].tolist())
-        out = ["[MASK]" if i in mask_idx else t for i, t in enumerate(tokens)]
-        return " ".join(out)
+from experiments.utils import load_sst2_sentences, make_stable_seed
+from kernel_isqed.ecosystem import Ecosystem
 
 
 def assert_honesty_split(fit_ids: np.ndarray, eval_ids: np.ndarray) -> tuple[int, int]:
@@ -113,103 +57,54 @@ def median_heuristic_gamma(x: np.ndarray) -> float:
     return 1.0 / (2.0 * med)
 
 
-def build_fallback_models():
-    peers = [
-        DeterministicTextModel("peer-bert", 3.2, 1.1, 0.1),
-        DeterministicTextModel("peer-distilbert", 2.8, 0.9, 0.5),
-        DeterministicTextModel("peer-albert", 2.4, 1.3, 1.0),
-        DeterministicTextModel("peer-xlnet", 2.2, 1.0, 1.5),
-    ]
-    targets = [
-        {"model": DeterministicTextModel("target-roberta", 1.9, 1.8, 0.9), "name": "Architectural Divergence (RoBERTa)", "type": "Low Redundancy"},
-        {"model": peers[1], "name": "Perfect Redundancy (Clone)", "type": "High Redundancy", "clone_of_peer_idx": 1},
-        {"model": DeterministicTextModel("target-distil-variant", 2.6, 1.2, 0.3), "name": "Parametric Divergence (Finetuned)", "type": "Uniqueness"},
-    ]
-    return peers, targets
+def model_revision(model: HuggingFaceWrapper) -> str:
+    config_revision = getattr(getattr(model.model, "config", None), "_commit_hash", None)
+    tokenizer_revision = getattr(model.tokenizer, "init_kwargs", {}).get("_commit_hash")
+    return str(config_revision or tokenizer_revision or "unresolved")
 
 
 def build_hf_models(device: str):
-    if HuggingFaceWrapper is None:
-        return [], []
-
     peer_ids = [
         "textattack/bert-base-uncased-SST-2",
         "textattack/distilbert-base-uncased-SST-2",
         "textattack/albert-base-v2-SST-2",
         "textattack/xlnet-base-cased-SST-2",
     ]
-    peers = []
-    for pid in peer_ids:
-        try:
-            peers.append(HuggingFaceWrapper(pid, device))
-        except Exception:
-            continue
-
-    targets = []
-    try:
-        targets.append(
-            {
-                "model": HuggingFaceWrapper("textattack/roberta-base-SST-2", device),
-                "name": "Architectural Divergence (RoBERTa)",
-                "type": "Low Redundancy",
-            }
-        )
-    except Exception:
-        pass
+    peers = [HuggingFaceWrapper(pid, device) for pid in peer_ids]
+    roberta_id = "textattack/roberta-base-SST-2"
+    targets = [
+        {
+            "model": HuggingFaceWrapper(roberta_id, device),
+            "name": "Architectural Divergence (RoBERTa)",
+            "type": "Low Redundancy",
+            "model_id": roberta_id,
+        }
+    ]
 
     distil_ref = next((p for p in peers if "distilbert" in p.name.lower()), None)
-    if distil_ref is not None:
-        targets.append(
-            {
-                "model": distil_ref,
-                "name": "Perfect Redundancy (Clone)",
-                "type": "High Redundancy",
-                "clone_of_peer_idx": peers.index(distil_ref),
-            }
-        )
-    try:
-        targets.append(
-            {
-                "model": HuggingFaceWrapper("distilbert-base-uncased-finetuned-sst-2-english", device),
-                "name": "Parametric Divergence (Finetuned)",
-                "type": "Uniqueness",
-            }
-        )
-    except Exception:
-        pass
+    if distil_ref is None:
+        raise RuntimeError("The required DistilBERT peer is missing from the text ecosystem.")
+    targets.append(
+        {
+            "model": distil_ref,
+            "name": "Perfect Redundancy (Clone)",
+            "type": "High Redundancy",
+            "clone_of_peer_idx": peers.index(distil_ref),
+            "model_id": distil_ref.name,
+        }
+    )
+    distil_target_id = "distilbert-base-uncased-finetuned-sst-2-english"
+    targets.append(
+        {
+            "model": HuggingFaceWrapper(distil_target_id, device),
+            "name": "Parametric Divergence (Finetuned)",
+            "type": "Uniqueness",
+            "model_id": distil_target_id,
+        }
+    )
+    if len(peers) != 4 or len(targets) != 3:
+        raise RuntimeError("The text ecosystem must contain four peers and three targets.")
     return peers, targets
-
-
-def load_sst2_sentences(max_samples: int, seed: int):
-    sentences = None
-    if load_dataset is not None:
-        try:
-            ds = load_dataset("glue", "sst2", split="validation")
-            sentences = ds["sentence"][:max_samples]
-        except Exception:
-            sentences = None
-    if sentences is None:
-        base = [
-            "This movie is great.",
-            "Terrible acting and boring scenes.",
-            "I loved every second of this film.",
-            "The storyline felt weak and predictable.",
-            "Excellent performance and direction.",
-            "I would not recommend this to anyone.",
-        ]
-        repeats = max(1, (max_samples + len(base) - 1) // len(base))
-        sentences = (base * repeats)[:max_samples]
-
-    arr = np.asarray(sentences, dtype=object)
-    rng = np.random.RandomState(seed)
-    perm = rng.permutation(len(arr))
-    arr = arr[perm]
-    n_fit = len(arr) // 2
-    fit_texts = arr[:n_fit].tolist()
-    eval_texts = arr[n_fit:].tolist()
-    fit_ids = perm[:n_fit]
-    eval_ids = perm[n_fit:]
-    return fit_texts, eval_texts, fit_ids, eval_ids
 
 
 def _fit_predict_kernel_ridge(
@@ -230,43 +125,18 @@ def _fit_predict_kernel_ridge(
     return pred_fit, pred_eval
 
 
-def _project_to_simplex(v: np.ndarray) -> np.ndarray:
-    x = np.asarray(v, dtype=float).reshape(-1)
-    if x.size == 0:
-        return x
-    u = np.sort(x)[::-1]
-    cssv = np.cumsum(u) - 1.0
-    ind = np.arange(1, len(u) + 1)
-    cond = u - cssv / ind > 0
-    if not np.any(cond):
-        return np.full_like(x, 1.0 / max(1, x.size))
-    rho = ind[cond][-1]
-    theta = cssv[cond][-1] / float(rho)
-    w = np.maximum(x - theta, 0.0)
-    s = w.sum()
-    if s <= 0:
-        return np.full_like(x, 1.0 / max(1, x.size))
-    return w / s
-
-
 def _convex_weights_and_pier(
     y_fit: np.ndarray, y_p_fit: np.ndarray, y_eval: np.ndarray, y_p_eval: np.ndarray
-) -> tuple[float, float]:
-    if DISCOSolver is not None:
-        dist_fit, w_hat = DISCOSolver.solve_weights_and_distance(y_fit.reshape(-1, 1), y_p_fit)
-        w_hat = np.asarray(w_hat, dtype=float).reshape(-1)
-        y_mix_eval = y_p_eval @ w_hat
-        convex_residual_eval = np.abs(y_eval - y_mix_eval)
-        return float(dist_fit), float(np.mean(convex_residual_eval))
-
-    # Fallback without cvxpy: unconstrained least squares + simplex projection.
-    w_ls, *_ = np.linalg.lstsq(np.asarray(y_p_fit, dtype=float), np.asarray(y_fit, dtype=float), rcond=None)
-    w_hat = _project_to_simplex(w_ls)
+) -> tuple[float, float, float]:
+    dist_fit, w_hat = DISCOSolver.solve_weights_and_distance(y_fit.reshape(-1, 1), y_p_fit)
+    if not np.isfinite(dist_fit) or w_hat is None or not np.all(np.isfinite(w_hat)):
+        raise RuntimeError("Convex DISCO solver failed to produce finite weights.")
+    w_hat = np.asarray(w_hat, dtype=float).reshape(-1)
     y_mix_fit = y_p_fit @ w_hat
     y_mix_eval = y_p_eval @ w_hat
-    dist_fit = float(np.mean(np.abs(np.asarray(y_fit, dtype=float) - y_mix_fit)))
-    convex_pier = float(np.mean(np.abs(np.asarray(y_eval, dtype=float) - y_mix_eval)))
-    return dist_fit, convex_pier
+    convex_pier_fit = float(np.mean(np.abs(np.asarray(y_fit, dtype=float) - y_mix_fit)))
+    convex_pier_eval = float(np.mean(np.abs(np.asarray(y_eval, dtype=float) - y_mix_eval)))
+    return float(dist_fit), convex_pier_fit, convex_pier_eval
 
 
 def run_bert_lambda_overfit_audit(
@@ -279,21 +149,21 @@ def run_bert_lambda_overfit_audit(
     monotonic_tol: float,
 ) -> pd.DataFrame:
     device = "cpu"
-    if torch is not None and torch.cuda.is_available():
+    if torch.cuda.is_available():
         device = "cuda"
         torch.manual_seed(0)
 
     peers, targets = build_hf_models(device=device)
-    use_fallback = False
-    if len(peers) < 2 or len(targets) == 0:
-        peers, targets = build_fallback_models()
-        use_fallback = True
-
-    fit_texts, eval_texts, fit_ids, eval_ids = load_sst2_sentences(max_samples=max_samples, seed=data_seed)
+    fit_texts, eval_texts, fit_ids, eval_ids, data_metadata = load_sst2_sentences(
+        max_samples=max_samples,
+        seed=data_seed,
+    )
     fit_size, eval_size = assert_honesty_split(fit_ids=fit_ids, eval_ids=eval_ids)
 
-    intervention = SimpleMaskingIntervention()
+    intervention = MaskingIntervention()
     lambda_list = sorted([float(v) for v in lambdas], reverse=True)
+    peer_model_ids = "|".join(peer.name for peer in peers)
+    peer_model_revisions = "|".join(model_revision(peer) for peer in peers)
 
     rows = []
     for t_info in targets:
@@ -309,7 +179,7 @@ def run_bert_lambda_overfit_audit(
         eval_seeds = [int(make_stable_seed(text=x, theta=float(theta))) for x in eval_x]
         y_eval, y_p_eval = eco.batched_query(X=eval_x, Thetas=eval_theta, intervention=intervention, seeds=eval_seeds)
 
-        dist_fit, convex_pier = _convex_weights_and_pier(
+        dist_fit, convex_pier_fit, convex_pier = _convex_weights_and_pier(
             y_fit=np.asarray(y_fit, dtype=float).reshape(-1),
             y_p_fit=np.asarray(y_p_fit, dtype=float),
             y_eval=np.asarray(y_eval, dtype=float).reshape(-1),
@@ -345,12 +215,13 @@ def run_bert_lambda_overfit_audit(
                     "lambda": float(lam),
                     "budget": float(1.0 / float(lam)),
                     "convex_fit_distance": float(dist_fit),
+                    "convex_pier_fit": convex_pier_fit,
                     "convex_pier": convex_pier,
                     "kernel_pier_eval": kernel_pier_eval,
                     "kernel_pier_fit": kernel_pier_fit,
                     "overfit_gap": overfit_gap,
                     "pier_drop_eval": float(convex_pier - kernel_pier_eval),
-                    "pier_drop_fit": float(convex_pier - kernel_pier_fit),
+                    "pier_drop_fit": float(convex_pier_fit - kernel_pier_fit),
                     "num_peers": int(len(peers)),
                     "n_fit": int(len(fit_texts)),
                     "n_eval": int(len(eval_texts)),
@@ -358,7 +229,25 @@ def run_bert_lambda_overfit_audit(
                     "honesty_eval_size": int(eval_size),
                     "kernel_type": str(kernel_type),
                     "gamma": float(gamma_used),
-                    "model_backend": "fallback" if use_fallback else "huggingface",
+                    "model_backend": "huggingface",
+                    "data_backend": data_metadata["data_backend"],
+                    "dataset_id": data_metadata["dataset_id"],
+                    "dataset_config": data_metadata["dataset_config"],
+                    "dataset_split": data_metadata["dataset_split"],
+                    "dataset_fingerprint": data_metadata["dataset_fingerprint"],
+                    "dataset_num_rows": data_metadata["dataset_num_rows"],
+                    "sampling_strategy": data_metadata["sampling_strategy"],
+                    "data_seed": data_metadata["data_seed"],
+                    "fit_dataset_indices": data_metadata["fit_dataset_indices"],
+                    "eval_dataset_indices": data_metadata["eval_dataset_indices"],
+                    "fit_label_0_count": data_metadata["fit_label_0_count"],
+                    "fit_label_1_count": data_metadata["fit_label_1_count"],
+                    "eval_label_0_count": data_metadata["eval_label_0_count"],
+                    "eval_label_1_count": data_metadata["eval_label_1_count"],
+                    "target_model_id": t_info["model_id"],
+                    "target_model_revision": model_revision(t_info["model"]),
+                    "peer_model_ids": peer_model_ids,
+                    "peer_model_revisions": peer_model_revisions,
                     "monotonic_tol": float(monotonic_tol),
                 }
             )

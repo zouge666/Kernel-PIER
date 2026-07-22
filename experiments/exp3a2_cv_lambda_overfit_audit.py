@@ -21,11 +21,10 @@ from isqed.geometry import DISCOSolver
 from isqed.real_world import AdversarialFGSMIntervention
 from exp3b_imagenet_kernel_adv import (
     assert_honesty_split,
-    build_fallback_models,
-    build_synthetic_samples,
     load_real_imagefolder_samples,
     load_real_models,
     median_heuristic_gamma,
+    model_provenance,
     split_fit_eval,
     standardize_by_fit,
 )
@@ -51,6 +50,7 @@ def _fit_predict_kernel_ridge(
 
 def run_experiment(
     data_root: str,
+    robust_checkpoint: str,
     max_samples: int,
     sample_seed: int,
     dose_epsilon: float,
@@ -64,20 +64,14 @@ def run_experiment(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(0)
 
-    samples = load_real_imagefolder_samples(data_root=data_root, max_samples=max_samples, seed=sample_seed)
+    samples, data_metadata = load_real_imagefolder_samples(
+        data_root=data_root,
+        max_samples=max_samples,
+        seed=sample_seed,
+    )
     backend_data = "imagefolder"
-    if samples is None:
-        samples = build_synthetic_samples(max_samples=max_samples, seed=sample_seed)
-        backend_data = "synthetic"
-
-    models = None
-    backend_model = "fallback_tiny"
-    if backend_data == "imagefolder":
-        models = load_real_models(device=device)
-        backend_model = "torchvision"
-    if models is None:
-        models = build_fallback_models(device=device)
-        backend_model = "fallback_tiny"
+    models = load_real_models(device=device, robust_checkpoint=robust_checkpoint)
+    backend_model = "torchvision"
 
     fit_samples, eval_samples, fit_ids, eval_ids = split_fit_eval(samples=samples, seed=sample_seed, fit_frac=0.5)
     fit_size, eval_size = assert_honesty_split(fit_ids=fit_ids, eval_ids=eval_ids)
@@ -96,6 +90,11 @@ def run_experiment(
     rows = []
     for t_idx, target in enumerate(models):
         peers = [m for i, m in enumerate(models) if i != t_idx]
+        target_metadata = model_provenance(target)
+        peer_weight_sources = "|".join(str(model_provenance(peer)["weight_source"]) for peer in peers)
+        peer_checkpoint_sha256s = "|".join(
+            str(model_provenance(peer)["checkpoint_sha256"]) for peer in peers
+        )
 
         y_fit_list = []
         y_peer_fit_list = []
@@ -148,7 +147,7 @@ def run_experiment(
             rows.append(
                 {
                     "target_model": target.name,
-                    "target_group": "Robust" if "Robust" in target.name else "Standard",
+                    "target_group": "Robust" if target_metadata["robust_training"] else "Standard",
                     "dose_epsilon": float(dose_epsilon),
                     "lambda": float(lam),
                     "budget": float(1.0 / float(lam)),
@@ -170,6 +169,16 @@ def run_experiment(
                     "gamma": float(gamma_used),
                     "data_backend": backend_data,
                     "model_backend": backend_model,
+                    "target_architecture": target_metadata["architecture"],
+                    "target_weight_source": target_metadata["weight_source"],
+                    "target_checkpoint_sha256": target_metadata["checkpoint_sha256"],
+                    "target_pretrained": int(bool(target_metadata["pretrained"])),
+                    "target_robust_training": int(bool(target_metadata["robust_training"])),
+                    "peer_weight_sources": peer_weight_sources,
+                    "peer_checkpoint_sha256s": peer_checkpoint_sha256s,
+                    "data_root": data_metadata["data_root"],
+                    "dataset_class_count": data_metadata["dataset_class_count"],
+                    "dataset_class_index_sha256": data_metadata["dataset_class_index_sha256"],
                     "monotonic_tol": float(monotonic_tol),
                 }
             )
@@ -197,7 +206,8 @@ def run_experiment(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Exp3a2: CV lambda-overfitting audit")
     parser.add_argument("--data-root", type=str, default="./data/imagenet/val")
-    parser.add_argument("--max-samples", type=int, default=80)
+    parser.add_argument("--robust-checkpoint", type=str, required=True)
+    parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--sample-seed", type=int, default=0)
     parser.add_argument("--dose-epsilon", type=float, default=0.1)
     parser.add_argument("--kernel-type", type=str, default="rbf")
@@ -218,6 +228,7 @@ def main() -> None:
 
     df = run_experiment(
         data_root=args.data_root,
+        robust_checkpoint=args.robust_checkpoint,
         max_samples=args.max_samples,
         sample_seed=args.sample_seed,
         dose_epsilon=args.dose_epsilon,

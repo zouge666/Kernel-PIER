@@ -87,6 +87,9 @@ def run_experiment(
     target_eval_list = [y[n_fit:] for y in targets_all]
 
     lambdas = [float(v) for v in lambdas]
+    if len(lambdas) != 1:
+        raise ValueError("Experiment 5 requires exactly one fixed lambda.")
+    fixed_lambda = lambdas[0]
     approx_dims = [int(d) for d in approx_dims]
     rows = []
     exact_piers = []
@@ -104,7 +107,7 @@ def run_experiment(
             approximation_mode="exact",
         )
         elapsed = float(time.perf_counter() - t0)
-        pier = float(np.mean(np.abs(exact_res.best_residuals)))
+        pier = float(np.mean(np.abs(exact_res.residuals_by_lambda[fixed_lambda])))
         exact_piers.append(pier)
         exact_times.append(elapsed)
         rows.append(
@@ -116,7 +119,9 @@ def run_experiment(
                 "runtime_sec": elapsed,
                 "kernel_pier_estimate": pier,
                 "approx_error_abs": 0.0,
-                "best_lambda": float(exact_res.best_lambda),
+                "best_lambda": float(fixed_lambda),
+                "fixed_lambda": float(fixed_lambda),
+                "lambda_selection": "fixed_single_candidate",
                 "fit_size": int(fit_size),
                 "eval_size": int(eval_size),
                 "honesty_fit_size": int(fit_size),
@@ -138,6 +143,8 @@ def run_experiment(
             "kernel_pier_estimate": float(np.mean(exact_piers_arr)),
             "approx_error_abs": 0.0,
             "best_lambda": np.nan,
+            "fixed_lambda": float(fixed_lambda),
+            "lambda_selection": "fixed_single_candidate",
             "fit_size": int(fit_size),
             "eval_size": int(eval_size),
             "honesty_fit_size": int(fit_size),
@@ -170,7 +177,7 @@ def run_experiment(
                     random_state=seed,
                 )
                 elapsed = float(time.perf_counter() - t0)
-                pier_hat = float(np.mean(np.abs(approx_res.best_residuals)))
+                pier_hat = float(np.mean(np.abs(approx_res.residuals_by_lambda[fixed_lambda])))
                 err = float(abs(pier_hat - exact_piers_arr[tid]))
                 approx_piers.append(pier_hat)
                 runtimes.append(elapsed)
@@ -183,7 +190,9 @@ def run_experiment(
                         "runtime_sec": elapsed,
                         "kernel_pier_estimate": pier_hat,
                         "approx_error_abs": err,
-                        "best_lambda": float(approx_res.best_lambda),
+                        "best_lambda": float(fixed_lambda),
+                        "fixed_lambda": float(fixed_lambda),
+                        "lambda_selection": "fixed_single_candidate",
                         "fit_size": int(fit_size),
                         "eval_size": int(eval_size),
                         "honesty_fit_size": int(fit_size),
@@ -206,6 +215,8 @@ def run_experiment(
                     "kernel_pier_estimate": float(np.mean(approx_piers_arr)),
                     "approx_error_abs": float(np.mean(np.abs(approx_piers_arr - exact_piers_arr))),
                     "best_lambda": np.nan,
+                    "fixed_lambda": float(fixed_lambda),
+                    "lambda_selection": "fixed_single_candidate",
                     "fit_size": int(fit_size),
                     "eval_size": int(eval_size),
                     "honesty_fit_size": int(fit_size),

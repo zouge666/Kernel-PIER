@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import os
 import sys
 from pathlib import Path
 from typing import Iterable
@@ -10,7 +8,6 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 import torch
-from datasets import load_dataset
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 KERNEL_PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -19,31 +16,11 @@ if str(ROOT_DIR) not in sys.path:
 if str(KERNEL_PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(KERNEL_PROJECT_DIR))
 
-from isqed.core import ModelUnit
-from isqed.ecosystem import Ecosystem
 from isqed.geometry import DISCOSolver
 from isqed.real_world import HuggingFaceWrapper, MaskingIntervention
-from experiments.utils import make_stable_seed
+from experiments.utils import load_sst2_sentences, make_stable_seed
+from kernel_isqed.ecosystem import Ecosystem
 from kernel_isqed import solve_kernel_residuals
-
-
-class DeterministicTextModel(ModelUnit):
-    def __init__(self, name: str, a: float, b: float, c: float):
-        super().__init__(name=name)
-        self.a = float(a)
-        self.b = float(b)
-        self.c = float(c)
-
-    def _forward(self, text_input):
-        text = str(text_input)
-        tokens = text.split()
-        n = max(1, len(tokens))
-        n_mask = sum(1 for t in tokens if t == "[MASK]")
-        mask_ratio = n_mask / float(n)
-        digest = hashlib.md5((self.name + "||" + text).encode("utf-8")).hexdigest()
-        h = (int(digest[:8], 16) % 10000) / 10000.0
-        z = self.a * (1.0 - mask_ratio) + self.b * np.sin(4.0 * h + self.c) + 0.2 * np.tanh(2.0 * h - 1.0)
-        return float(1.0 / (1.0 + np.exp(-z)))
 
 
 def assert_honesty_split(fit_ids: np.ndarray, eval_ids: np.ndarray) -> tuple[int, int]:
@@ -79,19 +56,10 @@ def median_heuristic_gamma(X: np.ndarray) -> float:
     return 1.0 / (2.0 * med)
 
 
-def build_fallback_models():
-    peers = [
-        DeterministicTextModel("peer-bert", 3.2, 1.1, 0.1),
-        DeterministicTextModel("peer-distilbert", 2.8, 0.9, 0.5),
-        DeterministicTextModel("peer-albert", 2.4, 1.3, 1.0),
-        DeterministicTextModel("peer-xlnet", 2.2, 1.0, 1.5),
-    ]
-    targets = [
-        {"model": DeterministicTextModel("target-roberta", 1.9, 1.8, 0.9), "name": "Architectural Divergence (RoBERTa)", "type": "Low Redundancy"},
-        {"model": peers[1], "name": "Perfect Redundancy (Clone)", "type": "High Redundancy", "clone_of_peer_idx": 1},
-        {"model": DeterministicTextModel("target-distil-variant", 2.6, 1.2, 0.3), "name": "Parametric Divergence (Finetuned)", "type": "Uniqueness"},
-    ]
-    return peers, targets
+def model_revision(model: HuggingFaceWrapper) -> str:
+    config_revision = getattr(getattr(model.model, "config", None), "_commit_hash", None)
+    tokenizer_revision = getattr(model.tokenizer, "init_kwargs", {}).get("_commit_hash")
+    return str(config_revision or tokenizer_revision or "unresolved")
 
 
 def build_hf_models(device: str):
@@ -101,74 +69,41 @@ def build_hf_models(device: str):
         "textattack/albert-base-v2-SST-2",
         "textattack/xlnet-base-cased-SST-2",
     ]
-    peers = []
-    for pid in peer_ids:
-        try:
-            peers.append(HuggingFaceWrapper(pid, device))
-        except Exception:
-            continue
-
-    targets = []
-    try:
-        targets.append(
-            {
-                "model": HuggingFaceWrapper("textattack/roberta-base-SST-2", device),
-                "name": "Architectural Divergence (RoBERTa)",
-                "type": "Low Redundancy",
-            }
-        )
-    except Exception:
-        pass
+    peers = [HuggingFaceWrapper(pid, device) for pid in peer_ids]
+    roberta_id = "textattack/roberta-base-SST-2"
+    targets = [
+        {
+            "model": HuggingFaceWrapper(roberta_id, device),
+            "name": "Architectural Divergence (RoBERTa)",
+            "type": "Low Redundancy",
+            "model_id": roberta_id,
+        }
+    ]
 
     distil_ref = next((p for p in peers if "distilbert" in p.name.lower()), None)
-    if distil_ref is not None:
-        targets.append(
-            {
-                "model": distil_ref,
-                "name": "Perfect Redundancy (Clone)",
-                "type": "High Redundancy",
-                "clone_of_peer_idx": peers.index(distil_ref),
-            }
-        )
-    try:
-        targets.append(
-            {
-                "model": HuggingFaceWrapper("distilbert-base-uncased-finetuned-sst-2-english", device),
-                "name": "Parametric Divergence (Finetuned)",
-                "type": "Uniqueness",
-            }
-        )
-    except Exception:
-        pass
+    if distil_ref is None:
+        raise RuntimeError("The required DistilBERT peer is missing from the text ecosystem.")
+    targets.append(
+        {
+            "model": distil_ref,
+            "name": "Perfect Redundancy (Clone)",
+            "type": "High Redundancy",
+            "clone_of_peer_idx": peers.index(distil_ref),
+            "model_id": distil_ref.name,
+        }
+    )
+    distil_target_id = "distilbert-base-uncased-finetuned-sst-2-english"
+    targets.append(
+        {
+            "model": HuggingFaceWrapper(distil_target_id, device),
+            "name": "Parametric Divergence (Finetuned)",
+            "type": "Uniqueness",
+            "model_id": distil_target_id,
+        }
+    )
+    if len(peers) != 4 or len(targets) != 3:
+        raise RuntimeError("The text ecosystem must contain four peers and three targets.")
     return peers, targets
-
-
-def load_sst2_sentences(max_samples: int, seed: int):
-    try:
-        ds = load_dataset("glue", "sst2", split="validation")
-        sentences = ds["sentence"][:max_samples]
-    except Exception:
-        base = [
-            "This movie is great.",
-            "Terrible acting and boring scenes.",
-            "I loved every second of this film.",
-            "The storyline felt weak and predictable.",
-            "Excellent performance and direction.",
-            "I would not recommend this to anyone.",
-        ]
-        repeats = max(1, (max_samples + len(base) - 1) // len(base))
-        sentences = (base * repeats)[:max_samples]
-
-    arr = np.asarray(sentences, dtype=object)
-    rng = np.random.RandomState(seed)
-    perm = rng.permutation(len(arr))
-    arr = arr[perm]
-    n_fit = len(arr) // 2
-    fit_texts = arr[:n_fit].tolist()
-    eval_texts = arr[n_fit:].tolist()
-    fit_ids = perm[:n_fit]
-    eval_ids = perm[n_fit:]
-    return fit_texts, eval_texts, fit_ids, eval_ids
 
 
 def run_bert_kernel_audit(
@@ -183,16 +118,16 @@ def run_bert_kernel_audit(
     torch.manual_seed(0)
 
     peers, targets = build_hf_models(device=device)
-    use_fallback = False
-    if len(peers) < 2 or len(targets) == 0:
-        peers, targets = build_fallback_models()
-        use_fallback = True
-
-    fit_texts, eval_texts, fit_ids, eval_ids = load_sst2_sentences(max_samples=max_samples, seed=data_seed)
+    fit_texts, eval_texts, fit_ids, eval_ids, data_metadata = load_sst2_sentences(
+        max_samples=max_samples,
+        seed=data_seed,
+    )
     fit_size, eval_size = assert_honesty_split(fit_ids=fit_ids, eval_ids=eval_ids)
 
     intervention = MaskingIntervention()
     lambda_list = [float(v) for v in lambdas]
+    peer_model_ids = "|".join(peer.name for peer in peers)
+    peer_model_revisions = "|".join(model_revision(peer) for peer in peers)
 
     rows = []
     for t_info in targets:
@@ -203,6 +138,8 @@ def run_bert_kernel_audit(
 
         y_fit, Y_p_fit = eco.batched_query(X=fit_X, Thetas=fit_Theta, intervention=intervention, seeds=fit_seeds)
         dist_fit, w_hat = DISCOSolver.solve_weights_and_distance(y_fit.reshape(-1, 1), Y_p_fit)
+        if not np.isfinite(dist_fit) or w_hat is None or not np.all(np.isfinite(w_hat)):
+            raise RuntimeError("Convex DISCO solver failed to produce finite weights.")
         w_hat = np.asarray(w_hat, dtype=float).reshape(-1)
 
         eval_X = eval_texts
@@ -247,7 +184,25 @@ def run_bert_kernel_audit(
                     "honesty_eval_size": int(eval_size),
                     "kernel_type": kernel_type,
                     "gamma": float(gamma_used),
-                    "model_backend": "fallback" if use_fallback else "huggingface",
+                    "model_backend": "huggingface",
+                    "data_backend": data_metadata["data_backend"],
+                    "dataset_id": data_metadata["dataset_id"],
+                    "dataset_config": data_metadata["dataset_config"],
+                    "dataset_split": data_metadata["dataset_split"],
+                    "dataset_fingerprint": data_metadata["dataset_fingerprint"],
+                    "dataset_num_rows": data_metadata["dataset_num_rows"],
+                    "sampling_strategy": data_metadata["sampling_strategy"],
+                    "data_seed": data_metadata["data_seed"],
+                    "fit_dataset_indices": data_metadata["fit_dataset_indices"],
+                    "eval_dataset_indices": data_metadata["eval_dataset_indices"],
+                    "fit_label_0_count": data_metadata["fit_label_0_count"],
+                    "fit_label_1_count": data_metadata["fit_label_1_count"],
+                    "eval_label_0_count": data_metadata["eval_label_0_count"],
+                    "eval_label_1_count": data_metadata["eval_label_1_count"],
+                    "target_model_id": t_info["model_id"],
+                    "target_model_revision": model_revision(t_info["model"]),
+                    "peer_model_ids": peer_model_ids,
+                    "peer_model_revisions": peer_model_revisions,
                 }
             )
     return pd.DataFrame(rows)

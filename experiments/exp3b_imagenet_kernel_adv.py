@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 KERNEL_PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -22,45 +23,86 @@ from isqed.real_world import AdversarialFGSMIntervention, ImageModelWrapper
 from kernel_isqed import solve_kernel_residuals
 
 
-class TinyVisionBackbone(nn.Module):
-    def __init__(self, seed: int, hidden_scale: float, n_classes: int = 10):
-        super().__init__()
-        torch.manual_seed(seed)
-        self.conv = nn.Conv2d(3, 8, kernel_size=3, padding=1, bias=False)
-        self.act = nn.GELU()
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(8, n_classes, bias=True)
-        with torch.no_grad():
-            self.conv.weight.mul_(hidden_scale)
-            self.fc.weight.mul_(hidden_scale)
-            self.fc.bias.mul_(hidden_scale)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv(x)
-        h = self.act(h)
-        h = self.pool(h).flatten(1)
-        out = self.fc(h)
-        return out
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-class TinyRobustBackbone(nn.Module):
-    def __init__(self, seed: int, n_classes: int = 10):
-        super().__init__()
-        torch.manual_seed(seed)
-        self.conv = nn.Conv2d(3, 8, kernel_size=3, padding=1, bias=False)
-        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
-        self.final = nn.Linear(8, n_classes, bias=True)
-        with torch.no_grad():
-            self.conv.weight.mul_(0.6)
-            self.final.weight.mul_(0.6)
-            self.final.bias.mul_(0.6)
+def set_model_provenance(
+    wrapper: ImageModelWrapper,
+    architecture: str,
+    weight_source: str,
+    checkpoint_sha256: str,
+    robust_training: bool,
+) -> ImageModelWrapper:
+    wrapper.architecture = architecture
+    wrapper.weight_source = weight_source
+    wrapper.checkpoint_sha256 = checkpoint_sha256
+    wrapper.pretrained = True
+    wrapper.robust_training = bool(robust_training)
+    return wrapper
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.pool(x)
-        h = torch.tanh(self.conv(h))
-        h = h.mean(dim=(2, 3))
-        out = self.final(h)
-        return out
+
+def model_provenance(wrapper: ImageModelWrapper) -> dict[str, object]:
+    return {
+        "architecture": str(wrapper.architecture),
+        "weight_source": str(wrapper.weight_source),
+        "checkpoint_sha256": str(wrapper.checkpoint_sha256),
+        "pretrained": bool(wrapper.pretrained),
+        "robust_training": bool(wrapper.robust_training),
+    }
+
+
+def extract_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
+    if not isinstance(checkpoint, dict):
+        raise TypeError("Robust checkpoint must contain a state dictionary.")
+    current = checkpoint
+    for key in ("state_dict", "model"):
+        value = current.get(key)
+        if isinstance(value, dict):
+            current = value
+            break
+    if not current or not all(isinstance(key, str) for key in current):
+        raise ValueError("Robust checkpoint state dictionary is empty or malformed.")
+    return current
+
+
+def compatible_state_dict(
+    checkpoint_state: dict[str, torch.Tensor],
+    model_state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    candidates = [checkpoint_state]
+    for prefix in (
+        "module.",
+        "model.",
+        "module.model.",
+        "attacker.model.",
+        "module.attacker.model.",
+    ):
+        candidate = {
+            key[len(prefix):]: value
+            for key, value in checkpoint_state.items()
+            if key.startswith(prefix)
+        }
+        if candidate:
+            candidates.append(candidate)
+    expected = set(model_state)
+    for candidate in candidates:
+        filtered = {key: value for key, value in candidate.items() if key in model_state}
+        if set(filtered) != expected:
+            continue
+        if all(tuple(filtered[key].shape) == tuple(model_state[key].shape) for key in expected):
+            return filtered
+    missing_best = min(
+        (expected - set(candidate) for candidate in candidates),
+        key=len,
+    )
+    raise ValueError(
+        f"Robust checkpoint is not a complete torchvision ResNet-50 state dict; missing {len(missing_best)} keys."
+    )
 
 
 def assert_honesty_split(fit_ids: np.ndarray, eval_ids: np.ndarray) -> tuple[int, int]:
@@ -95,21 +137,16 @@ def median_heuristic_gamma(X: np.ndarray) -> float:
     return 1.0 / (2.0 * med)
 
 
-def build_synthetic_samples(max_samples: int, seed: int) -> List[Tuple[torch.Tensor, int]]:
-    rng = np.random.RandomState(seed)
-    samples: List[Tuple[torch.Tensor, int]] = []
-    for _ in range(max_samples):
-        x = torch.tensor(rng.normal(0.0, 1.0, size=(3, 224, 224)), dtype=torch.float32)
-        y = int(rng.randint(0, 10))
-        samples.append((x, y))
-    return samples
-
-
 def split_fit_eval(
-    samples: List[Tuple[torch.Tensor, int]],
+    samples: list[tuple[torch.Tensor, int]],
     seed: int,
     fit_frac: float = 0.5,
-) -> tuple[List[Tuple[torch.Tensor, int]], List[Tuple[torch.Tensor, int]], np.ndarray, np.ndarray]:
+) -> tuple[
+    list[tuple[torch.Tensor, int]],
+    list[tuple[torch.Tensor, int]],
+    np.ndarray,
+    np.ndarray,
+]:
     rng = np.random.RandomState(seed)
     n = len(samples)
     idx = np.arange(n)
@@ -122,15 +159,20 @@ def split_fit_eval(
     return fit_samples, eval_samples, fit_idx, eval_idx
 
 
-def load_real_imagefolder_samples(data_root: str, max_samples: int, seed: int):
+def load_real_imagefolder_samples(
+    data_root: str,
+    max_samples: int,
+    seed: int,
+    expected_class_count: int = 1000,
+):
     try:
         import torchvision.datasets as datasets
         import torchvision.transforms as T
-    except Exception:
-        return None
-    root = Path(data_root)
-    if not root.exists():
-        return None
+    except Exception as exc:
+        raise RuntimeError("torchvision is required for the vision audit.") from exc
+    root = Path(data_root).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"ImageFolder root does not exist: {root}")
     transform = T.Compose(
         [
             T.Resize(256),
@@ -139,13 +181,14 @@ def load_real_imagefolder_samples(data_root: str, max_samples: int, seed: int):
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
-    try:
-        dataset = datasets.ImageFolder(root=str(root), transform=transform)
-    except Exception:
-        return None
+    dataset = datasets.ImageFolder(root=str(root), transform=transform)
     n = len(dataset)
     if n == 0:
-        return None
+        raise ValueError(f"ImageFolder is empty: {root}")
+    if len(dataset.classes) != int(expected_class_count):
+        raise ValueError(
+            f"Expected {expected_class_count} ImageNet classes, found {len(dataset.classes)} in {root}."
+        )
     rng = np.random.RandomState(seed)
     if max_samples < n:
         ids = rng.choice(n, size=max_samples, replace=False)
@@ -155,49 +198,100 @@ def load_real_imagefolder_samples(data_root: str, max_samples: int, seed: int):
     for i in ids:
         x, y = dataset[int(i)]
         samples.append((x, int(y)))
-    return samples
+    class_index_json = json.dumps(dataset.class_to_idx, ensure_ascii=True, sort_keys=True)
+    metadata = {
+        "data_root": str(root),
+        "dataset_class_count": int(len(dataset.classes)),
+        "dataset_class_index_sha256": hashlib.sha256(class_index_json.encode("utf-8")).hexdigest(),
+    }
+    return samples, metadata
 
 
-def load_real_models(device: str):
+def load_robust_resnet50(device: str, robust_checkpoint: str) -> ImageModelWrapper:
     try:
         import torchvision.models as tv_models
-    except Exception:
-        return None
-    models = []
-    loaders = [
-        ("ResNet18", lambda: tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1)),
-        ("ResNet50", lambda: tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V2)),
-        ("MobileNetV3Small", lambda: tv_models.mobilenet_v3_small(weights=tv_models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)),
-        ("EfficientNetB0", lambda: tv_models.efficientnet_b0(weights=tv_models.EfficientNet_B0_Weights.IMAGENET1K_V1)),
-        ("ConvNeXtTiny", lambda: tv_models.convnext_tiny(weights=tv_models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)),
-    ]
-    for name, fn in loaders:
-        try:
-            m = fn()
-            models.append(ImageModelWrapper(m, name, device, mode="tanh_margin"))
-        except Exception:
-            continue
+    except Exception as exc:
+        raise RuntimeError("torchvision is required for the vision audit.") from exc
+    checkpoint_path = Path(robust_checkpoint).expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Robust ResNet-50 checkpoint does not exist: {checkpoint_path}")
+    model = tv_models.resnet50(weights=None)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    state = extract_state_dict(checkpoint)
+    state = compatible_state_dict(state, model.state_dict())
+    model.load_state_dict(state, strict=True)
+    wrapper = ImageModelWrapper(model, "RobustResNet50", device, mode="tanh_margin")
+    return set_model_provenance(
+        wrapper=wrapper,
+        architecture="torchvision.models.resnet50",
+        weight_source=str(checkpoint_path),
+        checkpoint_sha256=sha256_file(checkpoint_path),
+        robust_training=True,
+    )
+
+
+def load_real_models(device: str, robust_checkpoint: str):
     try:
-        robust = TinyRobustBackbone(seed=99, n_classes=1000)
-        models.append(ImageModelWrapper(robust, "RobustResNet50", device, mode="tanh_margin"))
-    except Exception:
-        pass
-    return models if len(models) >= 4 else None
-
-
-def build_fallback_models(device: str):
-    models = [
-        ImageModelWrapper(TinyVisionBackbone(seed=11, hidden_scale=1.0, n_classes=10), "ResNet18", device, mode="tanh_margin"),
-        ImageModelWrapper(TinyVisionBackbone(seed=13, hidden_scale=0.9, n_classes=10), "ResNet50", device, mode="tanh_margin"),
-        ImageModelWrapper(TinyVisionBackbone(seed=17, hidden_scale=1.1, n_classes=10), "EfficientNetB0", device, mode="tanh_margin"),
-        ImageModelWrapper(TinyVisionBackbone(seed=19, hidden_scale=1.2, n_classes=10), "ConvNeXtTiny", device, mode="tanh_margin"),
-        ImageModelWrapper(TinyRobustBackbone(seed=23, n_classes=10), "RobustResNet50", device, mode="tanh_margin"),
+        import torchvision.models as tv_models
+    except Exception as exc:
+        raise RuntimeError("torchvision is required for the vision audit.") from exc
+    models: list[ImageModelWrapper] = []
+    loaders = [
+        (
+            "ResNet18",
+            "torchvision.models.resnet18",
+            "torchvision:ResNet18_Weights.IMAGENET1K_V1",
+            lambda: tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1),
+        ),
+        (
+            "ResNet50",
+            "torchvision.models.resnet50",
+            "torchvision:ResNet50_Weights.IMAGENET1K_V2",
+            lambda: tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V2),
+        ),
+        (
+            "MobileNetV3Small",
+            "torchvision.models.mobilenet_v3_small",
+            "torchvision:MobileNet_V3_Small_Weights.IMAGENET1K_V1",
+            lambda: tv_models.mobilenet_v3_small(
+                weights=tv_models.MobileNet_V3_Small_Weights.IMAGENET1K_V1
+            ),
+        ),
+        (
+            "EfficientNetB0",
+            "torchvision.models.efficientnet_b0",
+            "torchvision:EfficientNet_B0_Weights.IMAGENET1K_V1",
+            lambda: tv_models.efficientnet_b0(
+                weights=tv_models.EfficientNet_B0_Weights.IMAGENET1K_V1
+            ),
+        ),
+        (
+            "ConvNeXtTiny",
+            "torchvision.models.convnext_tiny",
+            "torchvision:ConvNeXt_Tiny_Weights.IMAGENET1K_V1",
+            lambda: tv_models.convnext_tiny(
+                weights=tv_models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1
+            ),
+        ),
     ]
+    for name, architecture, weight_source, loader in loaders:
+        wrapper = ImageModelWrapper(loader(), name, device, mode="tanh_margin")
+        models.append(
+            set_model_provenance(
+                wrapper=wrapper,
+                architecture=architecture,
+                weight_source=weight_source,
+                checkpoint_sha256="torchvision-managed",
+                robust_training=False,
+            )
+        )
+    models.append(load_robust_resnet50(device=device, robust_checkpoint=robust_checkpoint))
     return models
 
 
 def run_experiment(
     data_root: str,
+    robust_checkpoint: str,
     max_samples: int,
     sample_seed: int,
     doses_fit: Iterable[float],
@@ -211,20 +305,14 @@ def run_experiment(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(0)
 
-    samples = load_real_imagefolder_samples(data_root=data_root, max_samples=max_samples, seed=sample_seed)
+    samples, data_metadata = load_real_imagefolder_samples(
+        data_root=data_root,
+        max_samples=max_samples,
+        seed=sample_seed,
+    )
     backend_data = "imagefolder"
-    if samples is None:
-        samples = build_synthetic_samples(max_samples=max_samples, seed=sample_seed)
-        backend_data = "synthetic"
-
-    models = None
-    backend_model = "fallback_tiny"
-    if backend_data == "imagefolder":
-        models = load_real_models(device=device)
-        backend_model = "torchvision"
-    if models is None:
-        models = build_fallback_models(device=device)
-        backend_model = "fallback_tiny"
+    models = load_real_models(device=device, robust_checkpoint=robust_checkpoint)
+    backend_model = "torchvision"
 
     fit_samples, eval_samples, fit_ids, eval_ids = split_fit_eval(samples=samples, seed=sample_seed, fit_frac=0.5)
     fit_size, eval_size = assert_honesty_split(fit_ids=fit_ids, eval_ids=eval_ids)
@@ -245,6 +333,11 @@ def run_experiment(
     rows = []
     for t_idx, target in enumerate(models):
         peers = [m for i, m in enumerate(models) if i != t_idx]
+        target_metadata = model_provenance(target)
+        peer_weight_sources = "|".join(str(model_provenance(peer)["weight_source"]) for peer in peers)
+        peer_checkpoint_sha256s = "|".join(
+            str(model_provenance(peer)["checkpoint_sha256"]) for peer in peers
+        )
 
         y_fit_list = []
         Y_fit_list = []
@@ -292,7 +385,7 @@ def run_experiment(
                 rows.append(
                     {
                         "target_model": target.name,
-                        "target_group": "Robust" if "Robust" in target.name else "Standard",
+                        "target_group": "Robust" if target_metadata["robust_training"] else "Standard",
                         "dose_epsilon": float(eps),
                         "lambda": float(lam),
                         "budget": float(1.0 / float(lam)),
@@ -310,6 +403,16 @@ def run_experiment(
                         "gamma": float(gamma_used),
                         "data_backend": backend_data,
                         "model_backend": backend_model,
+                        "target_architecture": target_metadata["architecture"],
+                        "target_weight_source": target_metadata["weight_source"],
+                        "target_checkpoint_sha256": target_metadata["checkpoint_sha256"],
+                        "target_pretrained": int(bool(target_metadata["pretrained"])),
+                        "target_robust_training": int(bool(target_metadata["robust_training"])),
+                        "peer_weight_sources": peer_weight_sources,
+                        "peer_checkpoint_sha256s": peer_checkpoint_sha256s,
+                        "data_root": data_metadata["data_root"],
+                        "dataset_class_count": data_metadata["dataset_class_count"],
+                        "dataset_class_index_sha256": data_metadata["dataset_class_index_sha256"],
                     }
                 )
     return pd.DataFrame(rows)
@@ -318,7 +421,8 @@ def run_experiment(
 def main():
     parser = argparse.ArgumentParser(description="Exp3b: Image ecosystem kernel audit under FGSM doses")
     parser.add_argument("--data-root", type=str, default="./data/imagenet/val")
-    parser.add_argument("--max-samples", type=int, default=80)
+    parser.add_argument("--robust-checkpoint", type=str, required=True)
+    parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--sample-seed", type=int, default=0)
     parser.add_argument("--doses-fit", type=float, nargs="+", default=[0.0, 0.01, 0.02, 0.04])
     parser.add_argument("--doses-eval", type=float, nargs="+", default=[0.0, 0.02, 0.04, 0.06, 0.08, 0.1])
@@ -334,6 +438,7 @@ def main():
 
     df = run_experiment(
         data_root=args.data_root,
+        robust_checkpoint=args.robust_checkpoint,
         max_samples=args.max_samples,
         sample_seed=args.sample_seed,
         doses_fit=args.doses_fit,
